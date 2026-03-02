@@ -3,7 +3,6 @@ import SwiftUI
 struct MapContainerView: View {
     @EnvironmentObject var mapViewModel: MapViewModel
     @EnvironmentObject var navigationViewModel: NavigationViewModel
-    @State private var sheetDetent: PresentationDetent = .height(120)
 
     var body: some View {
         ZStack {
@@ -23,8 +22,8 @@ struct MapContainerView: View {
                     HStack {
                         Spacer()
                         VStack(spacing: 12) {
-                            RecenterButton()
-                            NearestButton()
+                            RecenterButton(action: mapViewModel.recenterOnUser)
+                            NearestButton(action: mapViewModel.findNearest)
                         }
                         .padding(.trailing, 16)
                         .padding(.bottom, 140)
@@ -43,8 +42,10 @@ struct MapContainerView: View {
 }
 
 private struct RecenterButton: View {
+    let action: () -> Void
+
     var body: some View {
-        Button(action: {}) {
+        Button(action: action) {
             Image(systemName: "location.fill")
                 .font(.system(size: 18, weight: .semibold))
                 .foregroundStyle(Color.accentBlue)
@@ -56,8 +57,10 @@ private struct RecenterButton: View {
 }
 
 private struct NearestButton: View {
+    let action: () -> Void
+
     var body: some View {
-        Button(action: {}) {
+        Button(action: action) {
             Image(systemName: "bolt.fill")
                 .font(.system(size: 18, weight: .semibold))
                 .foregroundStyle(Color.accentGreen)

@@ -11,11 +11,16 @@ struct SearchBar: View {
 
             TextField("Search shelters...", text: $searchText)
                 .foregroundStyle(Color.textPrimary)
+                .onChange(of: searchText) { _, newQuery in
+                    mapViewModel.search(query: newQuery)
+                }
                 .onSubmit {
                     mapViewModel.search(query: searchText)
                 }
 
-            Button(action: {}) {
+            Button(action: {
+                mapViewModel.findNearest()
+            }) {
                 Image(systemName: "line.3.horizontal")
                     .foregroundStyle(Color.textSecondary)
             }

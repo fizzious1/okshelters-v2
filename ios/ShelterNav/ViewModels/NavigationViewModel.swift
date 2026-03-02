@@ -22,11 +22,16 @@ final class NavigationViewModel: ObservableObject {
     @Published var estimatedArrival: String?
     @Published var routeCoordinates: [CLLocationCoordinate2D] = []
 
-    private let bridge = ShelterNavBridge()
+    private let bridge: ShelterNavBridge
+
+    init(bridge: ShelterNavBridge = .shared) {
+        self.bridge = bridge
+    }
 
     func startNavigation(to shelter: ShelterInfo, from location: CLLocationCoordinate2D) {
         destination = shelter
         isNavigating = true
+        Haptics.navigationStarted()
 
         Task {
             let route = await bridge.getRoute(
@@ -37,6 +42,10 @@ final class NavigationViewModel: ObservableObject {
             )
             routeCoordinates = route.path
             estimatedArrival = "\(route.estimatedSeconds / 60) min"
+            nextManeuver = ManeuverInfo(
+                instruction: "Continue to \(shelter.name)",
+                distanceM: route.totalDistanceM
+            )
         }
     }
 
