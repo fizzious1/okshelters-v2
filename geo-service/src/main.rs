@@ -1,16 +1,13 @@
-mod grpc;
-mod haversine;
-mod rtree;
-mod sync;
-
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::transport::Server;
 use tracing::{error, info};
 
-use grpc::pb::shelter_service_server::ShelterServiceServer;
-use grpc::ShelterServiceImpl;
-use rtree::ShelterIndex;
+use geo_service::grpc::pb::shelter_service_server::ShelterServiceServer;
+use geo_service::grpc::ShelterServiceImpl;
+use geo_service::haversine;
+use geo_service::rtree::ShelterIndex;
+use geo_service::sync;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,12 +21,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---- Configuration (env vars, no secrets in code) ----
     let database_url = std::env::var("DATABASE_URL").map_err(|_| {
-        "DATABASE_URL environment variable is required"
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "DATABASE_URL environment variable is required",
+        )
     })?;
 
-    let listen_addr = std::env::var("LISTEN_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:9001".to_string())
-        .parse()?;
+    let grpc_port = match std::env::var("GRPC_PORT") {
+        Ok(raw_port) => raw_port.parse::<u16>().map_err(|parse_error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid GRPC_PORT `{raw_port}`: {parse_error}"),
+            )
+        })?,
+        Err(_) => 9001,
+    };
+    let listen_addr = std::net::SocketAddr::from(([0, 0, 0, 0], grpc_port));
 
     // ---- Database pool ----
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -42,6 +49,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
 
     info!("connected to PostgreSQL");
+
+    let kernel = haversine::detect_best_kernel();
+    info!("distance kernel selected: {}", kernel.as_str());
 
     // ---- Spatial index ----
     let index = Arc::new(RwLock::new(ShelterIndex::new()));

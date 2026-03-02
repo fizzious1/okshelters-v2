@@ -1,16 +1,19 @@
-use rstar::{primitives::GeomWithData, RTree, RTreeObject, AABB};
-use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::sync::Arc;
 
-/// A shelter stored inside the R-tree.
-///
-/// We use `GeomWithData` from rstar with a 2-D point (lon, lat) as the
-/// geometry and the full shelter metadata as the associated payload. This
-/// avoids a second lookup after the spatial query.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+use rstar::{AABB, PointDistance, RTree, RTreeObject};
+
+/// Open shelter status value from the database enum.
+pub const STATUS_OPEN: i32 = 1;
+
+/// A shelter stored inside the in-memory R-tree.
+#[derive(Debug, Clone)]
 pub struct ShelterPoint {
     /// Database primary key.
     pub id: i32,
-    pub name: String,
+    /// Display name, interned once at load time.
+    pub name: Arc<str>,
     /// Latitude in degrees (WGS-84).
     pub lat: f64,
     /// Longitude in degrees (WGS-84).
@@ -21,28 +24,22 @@ pub struct ShelterPoint {
     pub occupancy: i32,
     /// 0 = closed, 1 = open, 2 = full.
     pub status: i32,
-    pub address: String,
+    pub address: Arc<str>,
 }
 
-// ---------------------------------------------------------------------------
-// rstar integration
-// ---------------------------------------------------------------------------
-
-/// The envelope type rstar uses for 2-D indexing.
 type Envelope = AABB<[f64; 2]>;
 
 impl RTreeObject for ShelterPoint {
     type Envelope = Envelope;
 
+    #[inline(always)]
     fn envelope(&self) -> Self::Envelope {
-        // rstar works in Cartesian space.  For small search radii the
-        // distortion from treating (lon, lat) as Cartesian is acceptable;
-        // final ordering is done by true Haversine distance.
         AABB::from_point([self.lon, self.lat])
     }
 }
 
-impl rstar::PointDistance for ShelterPoint {
+impl PointDistance for ShelterPoint {
+    #[inline(always)]
     fn distance_2(&self, point: &[f64; 2]) -> f64 {
         let dx = self.lon - point[0];
         let dy = self.lat - point[1];
@@ -50,17 +47,23 @@ impl rstar::PointDistance for ShelterPoint {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Index wrapper
-// ---------------------------------------------------------------------------
+/// Query controls for nearest-neighbor lookups.
+#[derive(Clone, Copy)]
+pub struct QueryConstraints<'a> {
+    /// Maximum Haversine distance in meters.
+    pub radius_m: f64,
+    /// Maximum number of results to return.
+    pub limit: usize,
+    /// Optional shelter type filter; empty means "all types".
+    pub allowed_types: &'a [i32],
+    /// When true, only shelters with `STATUS_OPEN` are returned.
+    pub open_only: bool,
+}
 
-/// Thread-safe wrapper around an `RTree<ShelterPoint>`.
-///
-/// The index lives behind `Arc<RwLock<ShelterIndex>>` so readers never block
-/// each other while the CDC sync task holds a write lock only during bulk
-/// mutations.
+/// Thread-safe in-memory shelter index.
 pub struct ShelterIndex {
     tree: RTree<ShelterPoint>,
+    by_id: HashMap<i32, ShelterPoint>,
 }
 
 impl ShelterIndex {
@@ -68,98 +71,148 @@ impl ShelterIndex {
     pub fn new() -> Self {
         Self {
             tree: RTree::new(),
+            by_id: HashMap::new(),
         }
     }
 
-    /// Bulk-load from a pre-existing vector. Much faster than repeated inserts
-    /// because rstar can use STR packing.
+    /// Bulk-load shelters into the R-tree using STR packing.
     pub fn from_bulk(points: Vec<ShelterPoint>) -> Self {
+        let mut by_id = HashMap::with_capacity(points.len());
+        for point in points {
+            by_id.insert(point.id, point);
+        }
+
+        let mut tree_points = Vec::with_capacity(by_id.len());
+        for point in by_id.values() {
+            tree_points.push(point.clone());
+        }
+
         Self {
-            tree: RTree::bulk_load(points),
+            tree: RTree::bulk_load(tree_points),
+            by_id,
         }
     }
 
-    /// Insert a single shelter into the index.
-    pub fn insert(&mut self, point: ShelterPoint) {
+    /// Replace the entire index using a fresh bulk-load set.
+    pub fn replace_bulk(&mut self, points: Vec<ShelterPoint>) {
+        *self = Self::from_bulk(points);
+    }
+
+    /// Insert or replace one shelter by `id`.
+    pub fn upsert(&mut self, point: ShelterPoint) {
+        if let Some(previous) = self.by_id.insert(point.id, point.clone()) {
+            let _ = self.tree.remove(&previous);
+        }
         self.tree.insert(point);
     }
 
-    /// Remove a shelter by matching on `id`. Returns `true` if found.
-    pub fn remove(&mut self, id: i32) -> bool {
-        // rstar requires the exact object for removal. We locate it first via
-        // a linear scan on the (small-ish, < 1M) dataset. In the future this
-        // can be backed by a HashMap<id, ShelterPoint> side index.
-        let maybe = self
-            .tree
-            .iter()
-            .find(|p| p.id == id)
-            .cloned();
+    /// Alias for upsert semantics.
+    pub fn insert(&mut self, point: ShelterPoint) {
+        self.upsert(point);
+    }
 
-        if let Some(point) = maybe {
-            self.tree.remove(&point);
-            true
-        } else {
-            false
+    /// Remove a shelter by `id`. Returns `true` when present.
+    pub fn remove(&mut self, id: i32) -> bool {
+        match self.by_id.remove(&id) {
+            Some(previous) => {
+                let _ = self.tree.remove(&previous);
+                true
+            }
+            None => false,
         }
     }
 
-    /// Find the nearest shelters within `radius_m` meters of (`lat`, `lon`),
-    /// returning at most `limit` results sorted by ascending Haversine
-    /// distance.
-    ///
-    /// Hot path -- this is the primary read query.
+    /// Find nearest shelters to (`lat`, `lon`) constrained by radius/type/status.
     #[inline(always)]
     pub fn find_nearest(
         &self,
         lat: f64,
         lon: f64,
-        radius_m: f64,
-        limit: usize,
+        constraints: QueryConstraints<'_>,
     ) -> Vec<(ShelterPoint, f64)> {
         use crate::haversine::haversine;
 
-        // rstar::nearest_neighbor_iter produces candidates in approximate
-        // Cartesian-distance order. We pull more than `limit` to account for
-        // projection distortion, compute true Haversine, filter by radius,
-        // sort, and truncate.
+        if constraints.limit == 0
+            || constraints.radius_m <= 0.0
+            || self.by_id.is_empty()
+        {
+            return Vec::new();
+        }
+
         let query_point = [lon, lat];
+        let tree_size = self.tree.size();
+        let mut fetch = constraints
+            .limit
+            .saturating_mul(8)
+            .max(128)
+            .min(tree_size);
 
-        // Over-fetch factor: at mid-latitudes the Cartesian approximation is
-        // decent, but we still pull 4x to be safe.
-        let fetch = limit.saturating_mul(4).max(64);
+        let mut candidates =
+            Vec::with_capacity(constraints.limit.min(fetch));
 
-        let mut results: Vec<(ShelterPoint, f64)> = self
-            .tree
-            .nearest_neighbor_iter(&query_point)
-            .take(fetch)
-            .filter_map(|p| {
-                let dist = haversine(lat, lon, p.lat, p.lon);
-                if dist <= radius_m {
-                    Some((p.clone(), dist))
-                } else {
-                    None
+        loop {
+            candidates.clear();
+
+            for point in self.tree.nearest_neighbor_iter(&query_point).take(fetch) {
+                if constraints.open_only && point.status != STATUS_OPEN {
+                    continue;
                 }
-            })
-            .collect();
 
-        // Sort by true distance ascending.
-        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(limit);
-        results
+                if !matches_type_filter(point.shelter_type, constraints.allowed_types) {
+                    continue;
+                }
+
+                let distance_m = haversine(lat, lon, point.lat, point.lon);
+                if distance_m <= constraints.radius_m {
+                    candidates.push((point.clone(), distance_m));
+                }
+            }
+
+            if candidates.len() >= constraints.limit || fetch >= tree_size {
+                break;
+            }
+
+            fetch = fetch.saturating_mul(2).min(tree_size);
+        }
+
+        candidates.sort_by(|left, right| {
+            match left
+                .1
+                .partial_cmp(&right.1)
+                .unwrap_or(Ordering::Equal)
+            {
+                Ordering::Equal => left.0.id.cmp(&right.0.id),
+                non_equal => non_equal,
+            }
+        });
+        candidates.truncate(constraints.limit);
+        candidates
     }
 
-    /// Total number of shelters in the index.
+    /// Number of shelters currently indexed.
     pub fn len(&self) -> usize {
-        self.tree.size()
+        self.by_id.len()
     }
 
-    /// Whether the index is empty.
+    /// Whether the index contains no shelters.
     pub fn is_empty(&self) -> bool {
-        self.tree.size() == 0
+        self.by_id.is_empty()
     }
 }
 
-// Needed so that `remove` can match objects inside the tree.
+#[inline(always)]
+fn matches_type_filter(shelter_type: i32, allowed_types: &[i32]) -> bool {
+    if allowed_types.is_empty() {
+        return true;
+    }
+
+    if allowed_types.len() == 1 {
+        return shelter_type == allowed_types[0];
+    }
+
+    allowed_types.contains(&shelter_type)
+}
+
 impl PartialEq for ShelterPoint {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
@@ -172,40 +225,44 @@ impl Eq for ShelterPoint {}
 mod tests {
     use super::*;
 
+    fn arc(value: &str) -> Arc<str> {
+        Arc::from(value)
+    }
+
     fn sample_shelters() -> Vec<ShelterPoint> {
         vec![
             ShelterPoint {
                 id: 1,
-                name: "Downtown Shelter".into(),
+                name: arc("Downtown Shelter"),
                 lat: 35.4676,
                 lon: -97.5164,
                 shelter_type: 0,
                 capacity: 100,
                 occupancy: 42,
-                status: 1,
-                address: "100 Main St".into(),
+                status: STATUS_OPEN,
+                address: arc("100 Main St"),
             },
             ShelterPoint {
                 id: 2,
-                name: "Midtown Haven".into(),
+                name: arc("Midtown Haven"),
                 lat: 35.4900,
                 lon: -97.5200,
                 shelter_type: 1,
                 capacity: 50,
                 occupancy: 10,
-                status: 1,
-                address: "200 Oak Ave".into(),
+                status: STATUS_OPEN,
+                address: arc("200 Oak Ave"),
             },
             ShelterPoint {
                 id: 3,
-                name: "Far Away Shelter".into(),
-                lat: 36.1540,
-                lon: -95.9928,
-                shelter_type: 2,
-                capacity: 200,
-                occupancy: 150,
-                status: 1,
-                address: "300 Tulsa Blvd".into(),
+                name: arc("Closed Shelter"),
+                lat: 35.4800,
+                lon: -97.5210,
+                shelter_type: 1,
+                capacity: 80,
+                occupancy: 80,
+                status: 0,
+                address: arc("300 Pine Rd"),
             },
         ]
     }
@@ -217,14 +274,53 @@ mod tests {
     }
 
     #[test]
-    fn find_nearest_within_radius() {
+    fn find_nearest_filters_open_and_type() {
         let idx = ShelterIndex::from_bulk(sample_shelters());
-        // Search near downtown OKC, 10 km radius -- should find the two OKC
-        // shelters but NOT Tulsa.
-        let results = idx.find_nearest(35.47, -97.52, 10_000.0, 10);
-        assert_eq!(results.len(), 2);
-        // Closest should be Downtown Shelter.
-        assert_eq!(results[0].0.id, 1);
+        let allowed_types = [1];
+
+        let results = idx.find_nearest(
+            35.47,
+            -97.52,
+            QueryConstraints {
+                radius_m: 10_000.0,
+                limit: 10,
+                allowed_types: &allowed_types,
+                open_only: true,
+            },
+        );
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.id, 2);
+    }
+
+    #[test]
+    fn upsert_replaces_existing_by_id() {
+        let mut idx = ShelterIndex::from_bulk(sample_shelters());
+        idx.upsert(ShelterPoint {
+            id: 2,
+            name: arc("Midtown Haven Updated"),
+            lat: 35.4902,
+            lon: -97.5195,
+            shelter_type: 1,
+            capacity: 55,
+            occupancy: 9,
+            status: STATUS_OPEN,
+            address: arc("200 Oak Ave"),
+        });
+
+        let results = idx.find_nearest(
+            35.4902,
+            -97.5195,
+            QueryConstraints {
+                radius_m: 500.0,
+                limit: 10,
+                allowed_types: &[],
+                open_only: false,
+            },
+        );
+
+        assert_eq!(results[0].0.id, 2);
+        assert_eq!(&*results[0].0.name, "Midtown Haven Updated");
     }
 
     #[test]
