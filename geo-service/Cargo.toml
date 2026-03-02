@@ -8,10 +8,18 @@ tonic = "0.12"
 prost = "0.13"
 rstar = "0.12"
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1"
+
 [build-dependencies]
 tonic-build = "0.12"
+
+[[bench]]
+name = "nearest_query"
+harness = false

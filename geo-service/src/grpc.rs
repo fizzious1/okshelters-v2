@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
-use crate::rtree::ShelterIndex;
+use crate::rtree::{QueryConstraints, ShelterIndex};
 
 /// Generated protobuf / tonic code.
 pub mod pb {
@@ -14,6 +14,7 @@ use pb::{NearestRequest, NearestResponse, RouteRequest, RouteResponse, ShelterIn
 
 /// gRPC service implementation backed by an in-memory R-tree.
 pub struct ShelterServiceImpl {
+    /// Shared shelter index guarded by an async read/write lock.
     pub index: Arc<RwLock<ShelterIndex>>,
 }
 
@@ -43,33 +44,38 @@ impl ShelterService for ShelterServiceImpl {
         };
 
         let limit = if req.limit == 0 {
-            20 // default limit
+            10 // default limit
         } else {
-            req.limit as usize
+            req.limit.min(100) as usize
         };
 
         let index = self.index.read().await;
-        let results = index.find_nearest(req.lat, req.lon, radius_m, limit);
+        let results = index.find_nearest(
+            req.lat,
+            req.lon,
+            QueryConstraints {
+                radius_m,
+                limit,
+                allowed_types: req.types.as_slice(),
+                open_only: true,
+            },
+        );
 
-        let shelters: Vec<ShelterInfo> = results
-            .into_iter()
-            .filter(|(p, _dist)| {
-                // If caller specified type filters, enforce them.
-                req.types.is_empty() || req.types.contains(&p.shelter_type)
-            })
-            .map(|(p, dist)| ShelterInfo {
-                id: p.id,
-                name: p.name,
-                lat: p.lat,
-                lon: p.lon,
-                r#type: p.shelter_type,
-                capacity: p.capacity,
-                occupancy: p.occupancy,
-                status: p.status,
-                address: p.address,
-                distance_m: dist,
-            })
-            .collect();
+        let mut shelters = Vec::with_capacity(results.len());
+        for (point, distance_m) in results {
+            shelters.push(ShelterInfo {
+                id: point.id,
+                name: point.name.to_string(),
+                lat: point.lat,
+                lon: point.lon,
+                r#type: point.shelter_type,
+                capacity: point.capacity,
+                occupancy: point.occupancy,
+                status: point.status,
+                address: point.address.to_string(),
+                distance_m,
+            });
+        }
 
         Ok(Response::new(NearestResponse { shelters }))
     }
