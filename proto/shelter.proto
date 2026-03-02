@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package shelternav.v1;
+
+option go_package = "github.com/okshelters/shelternav/gateway/pb";
+
+service ShelterService {
+  rpc FindNearest(NearestRequest) returns (NearestResponse);
+  rpc GetRoute(RouteRequest) returns (RouteResponse);
+}
+
+message NearestRequest {
+  double lat = 1;
+  double lon = 2;
+  uint32 radius_m = 3;
+  uint32 limit = 4;
+  repeated int32 types = 5;
+}
+
+message ShelterInfo {
+  int32 id = 1;
+  string name = 2;
+  double lat = 3;
+  double lon = 4;
+  int32 type = 5;
+  int32 capacity = 6;
+  int32 occupancy = 7;
+  int32 status = 8;
+  string address = 9;
+  double distance_m = 10;
+}
+
+message NearestResponse {
+  repeated ShelterInfo shelters = 1;
+}
+
+message RouteRequest {
+  double start_lat = 1;
+  double start_lon = 2;
+  double end_lat = 3;
+  double end_lon = 4;
+}
+
+message LatLon {
+  double lat = 1;
+  double lon = 2;
+}
+
+message Maneuver {
+  LatLon point = 1;
+  string instruction = 2;
+  double distance_m = 3;
+}
+
+message RouteResponse {
+  repeated LatLon path = 1;
+  double total_distance_m = 2;
+  uint32 estimated_seconds = 3;
+  repeated Maneuver maneuvers = 4;
+}

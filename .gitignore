@@ -1,0 +1,32 @@
+# Rust
+geo-service/target/
+
+# Go
+gateway/gateway
+
+# C build
+libshelternav/build/
+
+# iOS
+ios/*.xcodeproj/xcuserdata/
+ios/*.xcworkspace/xcuserdata/
+ios/DerivedData/
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.*
+!.env.example
