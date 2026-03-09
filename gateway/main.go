@@ -12,6 +12,7 @@ import (
 	"github.com/okshelters/shelternav/gateway/handler"
 	"github.com/okshelters/shelternav/gateway/middleware"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
@@ -57,13 +58,16 @@ func main() {
 	mux.HandleFunc("GET /v1/shelters/nearest", shelterHandler.HandleFindNearest)
 	mux.HandleFunc("GET /v1/route", shelterHandler.HandleGetRoute)
 	mux.HandleFunc("GET /healthz", handleHealthz)
+	mux.HandleFunc("GET /readyz", handleReadyz(conn))
 
 	// Compose middleware chain.
+	// Order of execution: recovery -> logging -> auth -> rate-limit -> cache -> handler
 	var chain http.Handler = mux
 	chain = middleware.Cache(cache, chain)
 	chain = middleware.RateLimit(rateLimiter, chain)
 	chain = middleware.Auth(chain)
 	chain = middleware.Logging(logger, chain)
+	chain = middleware.Recovery(logger, chain)
 
 	srv := &http.Server{
 		Addr:              listenAddr,
@@ -105,4 +109,18 @@ func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+func handleReadyz(conn *grpc.ClientConn) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		state := conn.GetState()
+		if state == connectivity.Ready || state == connectivity.Idle {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ready"}`))
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"status":"not_ready","connection_state":"` + state.String() + `"}`))
+	}
 }
