@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -64,9 +65,19 @@ func (h *ShelterHandler) HandleFindNearest(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	if err := validateCoordinate(lat, lon); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	radiusM, err := parseUint32(r, "radius", 5000)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid 'radius' parameter")
+		return
+	}
+
+	if radiusM == 0 || radiusM > 50000 {
+		writeError(w, http.StatusBadRequest, "'radius' must be between 1 and 50000 meters")
 		return
 	}
 
@@ -176,6 +187,15 @@ func (h *ShelterHandler) HandleGetRoute(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	if err := validateCoordinate(startLat, startLon); err != nil {
+		writeError(w, http.StatusBadRequest, "start: "+err.Error())
+		return
+	}
+	if err := validateCoordinate(endLat, endLon); err != nil {
+		writeError(w, http.StatusBadRequest, "end: "+err.Error())
+		return
+	}
+
 	start := time.Now()
 
 	rpcCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -229,6 +249,16 @@ func (h *ShelterHandler) HandleGetRoute(w http.ResponseWriter, r *http.Request) 
 }
 
 // --- helpers ---
+
+func validateCoordinate(lat, lon float64) error {
+	if lat < -90 || lat > 90 {
+		return fmt.Errorf("lat must be between -90 and 90")
+	}
+	if lon < -180 || lon > 180 {
+		return fmt.Errorf("lon must be between -180 and 180")
+	}
+	return nil
+}
 
 func parseFloat64(r *http.Request, key string) (float64, error) {
 	raw := r.URL.Query().Get(key)
