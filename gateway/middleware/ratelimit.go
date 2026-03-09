@@ -3,93 +3,107 @@ package middleware
 import (
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
-// bucket tracks token-bucket state for a single client.
-type bucket struct {
-	tokens     float64
-	lastRefill time.Time
+type clientLimiter struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
 }
 
-// RateLimiter implements a per-IP token bucket rate limiter.
-// All state is in-memory; no external dependencies.
+// RateLimiter implements per-IP token bucket limiting.
 type RateLimiter struct {
-	mu      sync.Mutex
-	buckets map[string]*bucket
-	rate    float64 // tokens per second
-	burst   float64 // maximum tokens (burst capacity)
+	mu            sync.Mutex
+	clients       map[string]*clientLimiter
+	limit         rate.Limit
+	burst         int
+	staleAfter    time.Duration
+	pruneInterval time.Duration
+	lastPruneAt   time.Time
 }
 
-// NewRateLimiter creates a rate limiter with the given sustained rate
-// (requests per second) and burst size.
-func NewRateLimiter(rate float64, burst float64) *RateLimiter {
+// NewRateLimiter creates a limiter with requests-per-second rate and burst.
+func NewRateLimiter(rps float64, burst int) *RateLimiter {
+	if rps <= 0 {
+		rps = 100
+	}
+	if burst < 1 {
+		burst = 1
+	}
+
 	return &RateLimiter{
-		buckets: make(map[string]*bucket),
-		rate:    rate,
-		burst:   burst,
+		clients:       make(map[string]*clientLimiter, 1024),
+		limit:         rate.Limit(rps),
+		burst:         burst,
+		staleAfter:    5 * time.Minute,
+		pruneInterval: 1 * time.Minute,
 	}
 }
 
-// allow checks whether the given key (IP) is allowed to proceed.
-// Returns true if a token was consumed, false if rate-limited.
-func (rl *RateLimiter) allow(key string) bool {
+func (rl *RateLimiter) allow(key string, now time.Time) bool {
+	limiter := rl.getLimiter(key, now)
+	return limiter.AllowN(now, 1)
+}
+
+func (rl *RateLimiter) getLimiter(key string, now time.Time) *rate.Limiter {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	now := time.Now()
-	b, exists := rl.buckets[key]
-	if !exists {
-		rl.buckets[key] = &bucket{
-			tokens:     rl.burst - 1, // consume one token immediately
-			lastRefill: now,
+	if now.Sub(rl.lastPruneAt) >= rl.pruneInterval {
+		for clientKey, client := range rl.clients {
+			if now.Sub(client.lastSeen) >= rl.staleAfter {
+				delete(rl.clients, clientKey)
+			}
 		}
-		return true
+		rl.lastPruneAt = now
 	}
 
-	// Refill tokens based on elapsed time.
-	elapsed := now.Sub(b.lastRefill).Seconds()
-	b.tokens += elapsed * rl.rate
-	if b.tokens > rl.burst {
-		b.tokens = rl.burst
-	}
-	b.lastRefill = now
-
-	if b.tokens < 1 {
-		return false
+	entry, ok := rl.clients[key]
+	if !ok {
+		entry = &clientLimiter{
+			limiter:  rate.NewLimiter(rl.limit, rl.burst),
+			lastSeen: now,
+		}
+		rl.clients[key] = entry
+		return entry.limiter
 	}
 
-	b.tokens--
-	return true
+	entry.lastSeen = now
+	return entry.limiter
 }
 
-// clientIP extracts the client IP from the request, preferring
-// X-Forwarded-For when behind a trusted reverse proxy.
 func clientIP(r *http.Request) string {
-	// In production, only trust X-Forwarded-For from known proxy IPs.
-	// For now, fall back to RemoteAddr.
-	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
+		parts := strings.Split(xff, ",")
+		if len(parts) > 0 {
+			if ip := strings.TrimSpace(parts[0]); ip != "" {
+				return ip
+			}
+		}
+	}
+
+	ip, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
 	if err != nil {
-		return r.RemoteAddr
+		if r.RemoteAddr == "" {
+			return "unknown"
+		}
+		return strings.TrimSpace(r.RemoteAddr)
 	}
 	return ip
 }
 
-// RateLimit returns middleware that enforces per-IP rate limiting.
-// Returns HTTP 429 when the client exceeds the configured rate.
+// RateLimit enforces per-IP rate limits and returns HTTP 429 when exceeded.
 func RateLimit(rl *RateLimiter, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip := clientIP(r)
-
-		if !rl.allow(ip) {
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if !rl.allow(clientIP(r), time.Now()) {
 			w.Header().Set("Retry-After", "1")
-			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = w.Write([]byte(`{"error":"rate limit exceeded"}`))
+			writeJSONError(w, http.StatusTooManyRequests, "rate limit exceeded")
 			return
 		}
-
 		next.ServeHTTP(w, r)
 	})
 }

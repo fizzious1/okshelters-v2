@@ -2,149 +2,86 @@ package middleware
 
 import (
 	"bytes"
+	"fmt"
+	"math"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
+
+	"github.com/golang/groupcache/lru"
 )
 
-// cacheEntry stores a captured HTTP response with an expiration time.
 type cacheEntry struct {
-	body       []byte
-	header     http.Header
 	statusCode int
+	header     http.Header
+	body       []byte
 	expiresAt  time.Time
-
-	// Doubly-linked list pointers for LRU eviction.
-	prev, next *cacheEntry
-	key        string
 }
 
-// ResponseCache is a simple in-memory LRU response cache for GET requests.
-// Keyed on the full request URL. Thread-safe via sync.RWMutex.
+// ResponseCache stores successful GET responses with TTL.
 type ResponseCache struct {
-	mu      sync.RWMutex
-	entries map[string]*cacheEntry
-	ttl     time.Duration
-	maxSize int
-
-	// Sentinel nodes for the doubly-linked list (most-recent at head).
-	head, tail *cacheEntry
+	mu    sync.Mutex
+	lru   *lru.Cache
+	ttl   time.Duration
+	nowFn func() time.Time
 }
 
-// NewResponseCache creates a cache with the given TTL and maximum number of entries.
-func NewResponseCache(ttl time.Duration, maxSize int) *ResponseCache {
-	head := &cacheEntry{}
-	tail := &cacheEntry{}
-	head.next = tail
-	tail.prev = head
-
+// NewResponseCache creates a response cache using groupcache LRU.
+func NewResponseCache(ttl time.Duration, maxEntries int) *ResponseCache {
+	if ttl <= 0 {
+		ttl = time.Second
+	}
+	if maxEntries < 1 {
+		maxEntries = 256
+	}
 	return &ResponseCache{
-		entries: make(map[string]*cacheEntry, maxSize),
-		ttl:     ttl,
-		maxSize: maxSize,
-		head:    head,
-		tail:    tail,
+		lru:   lru.New(maxEntries),
+		ttl:   ttl,
+		nowFn: time.Now,
 	}
 }
 
-// moveToFront moves an entry to the front of the LRU list.
-// Caller must hold the write lock.
-func (rc *ResponseCache) moveToFront(e *cacheEntry) {
-	// Remove from current position.
-	e.prev.next = e.next
-	e.next.prev = e.prev
-
-	// Insert after head sentinel.
-	e.next = rc.head.next
-	e.prev = rc.head
-	rc.head.next.prev = e
-	rc.head.next = e
-}
-
-// addToFront inserts a new entry at the front of the LRU list.
-// Caller must hold the write lock.
-func (rc *ResponseCache) addToFront(e *cacheEntry) {
-	e.next = rc.head.next
-	e.prev = rc.head
-	rc.head.next.prev = e
-	rc.head.next = e
-}
-
-// evictOldest removes the least recently used entry.
-// Caller must hold the write lock.
-func (rc *ResponseCache) evictOldest() {
-	oldest := rc.tail.prev
-	if oldest == rc.head {
-		return // list is empty
-	}
-	oldest.prev.next = rc.tail
-	rc.tail.prev = oldest.prev
-	delete(rc.entries, oldest.key)
-}
-
-// get retrieves a cached response if it exists and hasn't expired.
-func (rc *ResponseCache) get(key string) (*cacheEntry, bool) {
-	rc.mu.RLock()
-	e, exists := rc.entries[key]
-	rc.mu.RUnlock()
-
-	if !exists {
-		return nil, false
-	}
-
-	if time.Now().After(e.expiresAt) {
-		// Expired entry; remove it.
-		rc.mu.Lock()
-		// Double-check after acquiring write lock.
-		if e2, ok := rc.entries[key]; ok && time.Now().After(e2.expiresAt) {
-			e2.prev.next = e2.next
-			e2.next.prev = e2.prev
-			delete(rc.entries, key)
-		}
-		rc.mu.Unlock()
-		return nil, false
-	}
-
-	// Promote to front.
-	rc.mu.Lock()
-	rc.moveToFront(e)
-	rc.mu.Unlock()
-
-	return e, true
-}
-
-// put stores a response in the cache.
-func (rc *ResponseCache) put(key string, statusCode int, header http.Header, body []byte) {
+func (rc *ResponseCache) get(key string, now time.Time) (cacheEntry, bool) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
 
-	if existing, ok := rc.entries[key]; ok {
-		// Update existing entry.
-		existing.body = body
-		existing.header = header.Clone()
-		existing.statusCode = statusCode
-		existing.expiresAt = time.Now().Add(rc.ttl)
-		rc.moveToFront(existing)
-		return
+	v, ok := rc.lru.Get(key)
+	if !ok {
+		return cacheEntry{}, false
 	}
 
-	// Evict if at capacity.
-	if len(rc.entries) >= rc.maxSize {
-		rc.evictOldest()
+	entry, ok := v.(*cacheEntry)
+	if !ok {
+		rc.lru.Remove(key)
+		return cacheEntry{}, false
 	}
 
-	e := &cacheEntry{
-		key:        key,
-		body:       body,
-		header:     header.Clone(),
-		statusCode: statusCode,
-		expiresAt:  time.Now().Add(rc.ttl),
+	if now.After(entry.expiresAt) {
+		rc.lru.Remove(key)
+		return cacheEntry{}, false
 	}
-	rc.entries[key] = e
-	rc.addToFront(e)
+
+	return cacheEntry{
+		statusCode: entry.statusCode,
+		header:     entry.header.Clone(),
+		body:       append([]byte(nil), entry.body...),
+		expiresAt:  entry.expiresAt,
+	}, true
 }
 
-// responseBuffer captures a response written by the downstream handler.
+func (rc *ResponseCache) put(key string, statusCode int, header http.Header, body []byte, now time.Time) {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
+	rc.lru.Add(key, &cacheEntry{
+		statusCode: statusCode,
+		header:     header.Clone(),
+		body:       append([]byte(nil), body...),
+		expiresAt:  now.Add(rc.ttl),
+	})
+}
+
 type responseBuffer struct {
 	http.ResponseWriter
 	buf        bytes.Buffer
@@ -167,20 +104,17 @@ func (rb *responseBuffer) Write(b []byte) (int, error) {
 	return rb.ResponseWriter.Write(b)
 }
 
-// Cache returns middleware that caches GET responses in-memory with LRU eviction.
-// Only successful responses (2xx) are cached. Non-GET requests pass through.
+// Cache caches successful GET responses for supported API endpoints.
 func Cache(rc *ResponseCache, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Only cache GET requests.
-		if r.Method != http.MethodGet {
+		cacheKey, cacheable := requestCacheKey(r)
+		if !cacheable {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		key := r.URL.String()
-
-		// Check cache.
-		if entry, ok := rc.get(key); ok {
+		now := rc.nowFn()
+		if entry, ok := rc.get(cacheKey, now); ok {
 			for k, vals := range entry.header {
 				for _, v := range vals {
 					w.Header().Add(k, v)
@@ -192,18 +126,54 @@ func Cache(rc *ResponseCache, next http.Handler) http.Handler {
 			return
 		}
 
-		// Cache miss: capture the response.
-		buf := &responseBuffer{
-			ResponseWriter: w,
-			statusCode:     http.StatusOK,
-		}
-
 		w.Header().Set("X-Cache", "MISS")
+		buf := &responseBuffer{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(buf, r)
 
-		// Only cache successful responses.
 		if buf.statusCode >= 200 && buf.statusCode < 300 {
-			rc.put(key, buf.statusCode, w.Header(), buf.buf.Bytes())
+			rc.put(cacheKey, buf.statusCode, w.Header(), buf.buf.Bytes(), now)
 		}
 	})
+}
+
+func requestCacheKey(r *http.Request) (string, bool) {
+	if r.Method != http.MethodGet {
+		return "", false
+	}
+
+	switch r.URL.Path {
+	case "/api/v1/shelters/nearest":
+		return nearestCacheKey(r)
+	case "/api/v1/route":
+		return "route:" + r.URL.RawQuery, true
+	default:
+		return "", false
+	}
+}
+
+func nearestCacheKey(r *http.Request) (string, bool) {
+	q := r.URL.Query()
+	lat, err := strconv.ParseFloat(q.Get("lat"), 64)
+	if err != nil {
+		return "", false
+	}
+	lon, err := strconv.ParseFloat(q.Get("lon"), 64)
+	if err != nil {
+		return "", false
+	}
+
+	radius := q.Get("radius")
+	if radius == "" {
+		radius = "5000"
+	}
+	limit := q.Get("limit")
+	if limit == "" {
+		limit = "10"
+	}
+
+	return fmt.Sprintf("nearest:%.4f:%.4f:%s:%s", roundCoord(lat), roundCoord(lon), radius, limit), true
+}
+
+func roundCoord(v float64) float64 {
+	return math.Round(v*10000) / 10000
 }
