@@ -8,102 +8,89 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/okshelters/shelternav/gateway/client"
 	pb "github.com/okshelters/shelternav/gateway/pb"
-	"google.golang.org/grpc"
 )
+
+const rpcTimeout = 3 * time.Second
 
 // ShelterHandler holds dependencies for shelter-related HTTP handlers.
 type ShelterHandler struct {
-	geoClient pb.ShelterServiceClient
+	geoClient client.GeoClient
 	logger    *slog.Logger
 }
 
-// NewShelterHandler creates a handler wired to the geo-service gRPC connection.
-func NewShelterHandler(conn grpc.ClientConnInterface, logger *slog.Logger) *ShelterHandler {
+// NewShelterHandler creates a handler wired to the geo-service client.
+func NewShelterHandler(geoClient client.GeoClient, logger *slog.Logger) *ShelterHandler {
 	return &ShelterHandler{
-		geoClient: pb.NewShelterServiceClient(conn),
+		geoClient: geoClient,
 		logger:    logger,
 	}
 }
 
 // shelterJSON is the JSON response representation of a shelter.
-// Kept separate from protobuf to control the public API surface.
 type shelterJSON struct {
-	ID         int32   `json:"id"`
-	Name       string  `json:"name"`
-	Lat        float64 `json:"lat"`
-	Lon        float64 `json:"lon"`
-	Type       int32   `json:"type"`
-	Capacity   int32   `json:"capacity"`
-	Occupancy  int32   `json:"occupancy"`
-	Status     int32   `json:"status"`
-	Address    string  `json:"address"`
-	DistanceM  float64 `json:"distance_m"`
+	ID        int32   `json:"id"`
+	Name      string  `json:"name"`
+	Lat       float64 `json:"lat"`
+	Lon       float64 `json:"lon"`
+	Type      int32   `json:"type"`
+	Capacity  int32   `json:"capacity"`
+	Occupancy int32   `json:"occupancy"`
+	Status    int32   `json:"status"`
+	Address   string  `json:"address"`
+	DistanceM float64 `json:"distance_m"`
 }
 
-// nearestResponse is the top-level JSON envelope for find-nearest results.
 type nearestResponse struct {
 	Shelters []shelterJSON `json:"shelters"`
-	QueryMs  float64       `json:"query_ms"`
+	QueryMS  float64       `json:"query_ms"`
 }
 
-// HandleFindNearest parses lat/lon/radius/limit from query params, calls
-// the geo-service FindNearest RPC, and returns a JSON response.
+// HandleFindNearest handles GET /api/v1/shelters/nearest.
 func (h *ShelterHandler) HandleFindNearest(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
 	lat, err := parseFloat64(r, "lat")
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid or missing 'lat' parameter")
+		WriteJSONError(w, http.StatusBadRequest, "invalid or missing lat")
 		return
 	}
 
 	lon, err := parseFloat64(r, "lon")
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid or missing 'lon' parameter")
+		WriteJSONError(w, http.StatusBadRequest, "invalid or missing lon")
 		return
 	}
 
 	radiusM, err := parseUint32(r, "radius", 5000)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid 'radius' parameter")
+		WriteJSONError(w, http.StatusBadRequest, "invalid radius")
 		return
 	}
 
 	limit, err := parseUint32(r, "limit", 10)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid 'limit' parameter")
+		WriteJSONError(w, http.StatusBadRequest, "invalid limit")
 		return
 	}
-
-	// Cap limit to prevent abuse.
 	if limit > 100 {
 		limit = 100
 	}
 
 	start := time.Now()
-
-	// Propagate request context with a tight deadline for the geo-service call.
-	rpcCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), rpcTimeout)
 	defer cancel()
 
-	resp, err := h.geoClient.FindNearest(rpcCtx, &pb.NearestRequest{
-		Lat:      lat,
-		Lon:      lon,
-		RadiusM:  radiusM,
-		Limit:    limit,
+	resp, err := h.geoClient.FindNearest(ctx, &pb.NearestRequest{
+		Lat:     lat,
+		Lon:     lon,
+		RadiusM: radiusM,
+		Limit:   limit,
 	})
 	if err != nil {
-		h.logger.ErrorContext(ctx, "geo-service FindNearest failed",
-			slog.String("error", err.Error()),
-			slog.Float64("lat", lat),
-			slog.Float64("lon", lon),
-		)
-		writeError(w, http.StatusBadGateway, "upstream service error")
+		h.logger.ErrorContext(r.Context(), "handler nearest", slog.String("error", err.Error()))
+		WriteJSONError(w, http.StatusBadGateway, "upstream service error")
 		return
 	}
-
-	elapsed := time.Since(start)
 
 	shelters := make([]shelterJSON, 0, len(resp.GetShelters()))
 	for _, s := range resp.GetShelters() {
@@ -121,19 +108,18 @@ func (h *ShelterHandler) HandleFindNearest(w http.ResponseWriter, r *http.Reques
 		})
 	}
 
-	writeJSON(w, http.StatusOK, nearestResponse{
+	WriteJSON(w, http.StatusOK, nearestResponse{
 		Shelters: shelters,
-		QueryMs:  float64(elapsed.Microseconds()) / 1000.0,
+		QueryMS:  float64(time.Since(start).Microseconds()) / 1000,
 	})
 }
 
-// routeJSON is the JSON response representation of a route.
 type routeJSON struct {
 	Path             []latLonJSON   `json:"path"`
 	TotalDistanceM   float64        `json:"total_distance_m"`
 	EstimatedSeconds uint32         `json:"estimated_seconds"`
 	Maneuvers        []maneuverJSON `json:"maneuvers"`
-	QueryMs          float64        `json:"query_ms"`
+	QueryMS          float64        `json:"query_ms"`
 }
 
 type latLonJSON struct {
@@ -147,88 +133,77 @@ type maneuverJSON struct {
 	DistanceM   float64    `json:"distance_m"`
 }
 
-// HandleGetRoute parses start/end coordinates, calls the geo-service GetRoute
-// RPC, and returns a JSON response.
+// HandleGetRoute handles GET /api/v1/route.
 func (h *ShelterHandler) HandleGetRoute(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	startLat, err := parseFloat64(r, "start_lat")
+	fromLat, err := parseFloat64Multi(r, "from_lat", "start_lat")
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid or missing 'start_lat' parameter")
+		WriteJSONError(w, http.StatusBadRequest, "invalid or missing from_lat")
 		return
 	}
 
-	startLon, err := parseFloat64(r, "start_lon")
+	fromLon, err := parseFloat64Multi(r, "from_lon", "start_lon")
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid or missing 'start_lon' parameter")
+		WriteJSONError(w, http.StatusBadRequest, "invalid or missing from_lon")
 		return
 	}
 
-	endLat, err := parseFloat64(r, "end_lat")
+	toLat, err := parseFloat64Multi(r, "to_lat", "end_lat")
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid or missing 'end_lat' parameter")
+		WriteJSONError(w, http.StatusBadRequest, "invalid or missing to_lat")
 		return
 	}
 
-	endLon, err := parseFloat64(r, "end_lon")
+	toLon, err := parseFloat64Multi(r, "to_lon", "end_lon")
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid or missing 'end_lon' parameter")
+		WriteJSONError(w, http.StatusBadRequest, "invalid or missing to_lon")
 		return
 	}
 
 	start := time.Now()
-
-	rpcCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), rpcTimeout)
 	defer cancel()
 
-	resp, err := h.geoClient.GetRoute(rpcCtx, &pb.RouteRequest{
-		StartLat: startLat,
-		StartLon: startLon,
-		EndLat:   endLat,
-		EndLon:   endLon,
+	resp, err := h.geoClient.GetRoute(ctx, &pb.RouteRequest{
+		StartLat: fromLat,
+		StartLon: fromLon,
+		EndLat:   toLat,
+		EndLon:   toLon,
 	})
 	if err != nil {
-		h.logger.ErrorContext(ctx, "geo-service GetRoute failed",
-			slog.String("error", err.Error()),
-			slog.Float64("start_lat", startLat),
-			slog.Float64("start_lon", startLon),
-			slog.Float64("end_lat", endLat),
-			slog.Float64("end_lon", endLon),
-		)
-		writeError(w, http.StatusBadGateway, "upstream service error")
+		h.logger.ErrorContext(r.Context(), "handler route", slog.String("error", err.Error()))
+		WriteJSONError(w, http.StatusBadGateway, "upstream service error")
 		return
 	}
 
-	elapsed := time.Since(start)
-
 	path := make([]latLonJSON, 0, len(resp.GetPath()))
-	for _, p := range resp.GetPath() {
-		path = append(path, latLonJSON{Lat: p.GetLat(), Lon: p.GetLon()})
+	for _, point := range resp.GetPath() {
+		path = append(path, latLonJSON{
+			Lat: point.GetLat(),
+			Lon: point.GetLon(),
+		})
 	}
 
 	maneuvers := make([]maneuverJSON, 0, len(resp.GetManeuvers()))
 	for _, m := range resp.GetManeuvers() {
-		pt := latLonJSON{}
+		point := latLonJSON{}
 		if m.GetPoint() != nil {
-			pt = latLonJSON{Lat: m.GetPoint().GetLat(), Lon: m.GetPoint().GetLon()}
+			point = latLonJSON{Lat: m.GetPoint().GetLat(), Lon: m.GetPoint().GetLon()}
 		}
 		maneuvers = append(maneuvers, maneuverJSON{
-			Point:       pt,
+			Point:       point,
 			Instruction: m.GetInstruction(),
 			DistanceM:   m.GetDistanceM(),
 		})
 	}
 
-	writeJSON(w, http.StatusOK, routeJSON{
+	WriteJSON(w, http.StatusOK, routeJSON{
 		Path:             path,
 		TotalDistanceM:   resp.GetTotalDistanceM(),
 		EstimatedSeconds: resp.GetEstimatedSeconds(),
 		Maneuvers:        maneuvers,
-		QueryMs:          float64(elapsed.Microseconds()) / 1000.0,
+		QueryMS:          float64(time.Since(start).Microseconds()) / 1000,
 	})
 }
-
-// --- helpers ---
 
 func parseFloat64(r *http.Request, key string) (float64, error) {
 	raw := r.URL.Query().Get(key)
@@ -236,6 +211,15 @@ func parseFloat64(r *http.Request, key string) (float64, error) {
 		return 0, strconv.ErrSyntax
 	}
 	return strconv.ParseFloat(raw, 64)
+}
+
+func parseFloat64Multi(r *http.Request, keys ...string) (float64, error) {
+	for _, key := range keys {
+		if raw := r.URL.Query().Get(key); raw != "" {
+			return strconv.ParseFloat(raw, 64)
+		}
+	}
+	return 0, strconv.ErrSyntax
 }
 
 func parseUint32(r *http.Request, key string, defaultVal uint32) (uint32, error) {
@@ -250,14 +234,17 @@ func parseUint32(r *http.Request, key string, defaultVal uint32) (uint32, error)
 	return uint32(v), nil
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+// WriteJSON writes a JSON response.
+func WriteJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func writeError(w http.ResponseWriter, status int, msg string) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+// WriteJSONError writes a standard error envelope.
+func WriteJSONError(w http.ResponseWriter, status int, message string) {
+	WriteJSON(w, status, map[string]any{
+		"error": message,
+		"code":  status,
+	})
 }
