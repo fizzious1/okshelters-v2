@@ -58,6 +58,10 @@ func main() {
 	mux.HandleFunc("GET /v1/route", shelterHandler.HandleGetRoute)
 	mux.HandleFunc("GET /healthz", handleHealthz)
 
+	// Serve the web UI from the web/ directory. Registered last so API
+	// routes take precedence. Uses http.Dir for safe, rooted file access.
+	mux.Handle("/", http.FileServer(http.Dir("web")))
+
 	// Compose middleware chain.
 	var chain http.Handler = mux
 	chain = middleware.Cache(cache, chain)

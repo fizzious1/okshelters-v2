@@ -35,6 +35,28 @@ This starts PostgreSQL (with PostGIS + migrations), the Rust geo-service, and th
 - **Health check**: http://localhost:8080/healthz
 - **Geo Service gRPC**: localhost:9001
 
+## Web UI
+
+ShelterNav includes a browser-based map interface served directly by the Go gateway. It uses MapLibre GL JS for the interactive map, matches the native app dark theme, and falls back to built-in demo data when the geo-service is unavailable.
+
+**With Docker (full stack):**
+
+```bash
+docker-compose up --build
+```
+
+Then open http://localhost:8080 in your browser.
+
+**Local dev (gateway only, demo mode):**
+
+```bash
+cd gateway && go run .
+```
+
+Then open http://localhost:8080. Without the geo-service running, the UI automatically enters demo mode and displays sample Oklahoma City shelters with mock navigation routes.
+
+The web UI features a dark-themed interactive map centered on Oklahoma City, a frosted-glass search bar, a draggable bottom sheet with shelter cards showing real-time capacity bars, floating action buttons for geolocation and nearest-shelter lookup, and a full navigation overlay with route visualization and turn-by-turn maneuvers.
+
 ## Prerequisites
 
 For local development outside Docker:
@@ -141,6 +163,7 @@ Returns `{"status":"ok"}` when the gateway is running.
 proto/            Protobuf service definitions (Buf v2)
 geo-service/      Rust gRPC spatial query service
 gateway/          Go HTTP gateway + middleware
+gateway/web/      Browser-based map UI (HTML/CSS/JS, no build step)
 libshelternav/    C core library + SIMD assembly
 ios/              SwiftUI iOS app
 android/          Jetpack Compose Android app
