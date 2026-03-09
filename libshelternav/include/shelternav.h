@@ -124,7 +124,7 @@ void sn_haversine_batch(double origin_lat, double origin_lon,
  * path_len:  in: capacity of path_out; out: number of maneuvers written.
  *
  * Returns SN_OK on success, SN_ERR_NO_PATH if unreachable,
- * or SN_ERR_NOT_IMPLEMENTED while the stub is in place.
+ * or another negative error code on invalid graph/input.
  */
 int sn_route_astar(const SN_RoadGraph *graph,
                    SN_LatLon start,
