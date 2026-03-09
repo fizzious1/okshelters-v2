@@ -6,6 +6,7 @@ gateway/gateway
 
 # C build
 libshelternav/build/
+*.o
 
 # iOS
 ios/*.xcodeproj/xcuserdata/
@@ -25,6 +26,9 @@ android/local.properties
 *.swo
 *~
 .DS_Store
+
+# Local agent worktrees
+.claude/worktrees/
 
 # Environment
 .env

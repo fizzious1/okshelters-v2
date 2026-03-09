@@ -140,3 +140,8 @@ migrations/      → Backend (reviewed by all)
 2. Is the dependency trustworthy? → Check the rules above. If still unsure, don't add it. Write it yourself.
 3. Can it work offline? → It must.
 4. Does it fit in 12ms? → If not, profile and optimize before shipping.
+## Git Workflow (Mandatory)
+
+- Work only in branches of the GitHub repository.
+- Do not do feature work directly on `main`.
+- Merge the working branch back into the repository when the task is done.
