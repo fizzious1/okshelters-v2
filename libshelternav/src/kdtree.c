@@ -5,14 +5,13 @@
  * at each level of the tree.
  *
  * TODO: Replace malloc with a pre-allocated arena allocator to eliminate
- *       dynamic allocation in the query path.
+ *       dynamic allocation in the build/insert path.
  */
 
 #include "shelternav.h"
 
-#include <stdlib.h>
-#include <string.h>
 #include <math.h>
+#include <stdlib.h>
 
 /* -------------------------------------------------------------------
  * Internal node representation
@@ -29,16 +28,25 @@ struct SN_KDNode {
  * Helpers
  * ------------------------------------------------------------------- */
 
-/** Return the split-axis value for a node's shelter. */
-static double node_axis_val(const SN_KDNode *node)
-{
-    return (node->split_axis == 0) ? node->shelter.lat : node->shelter.lon;
-}
-
 /** Return the split-axis value for a query point. */
-static double point_axis_val(double lat, double lon, int axis)
+static inline double point_axis_val(double lat, double lon, int axis)
 {
     return (axis == 0) ? lat : lon;
+}
+
+/** Allocate and initialise one KD-tree node. */
+static SN_KDNode *node_create(const SN_Shelter *shelter, int split_axis)
+{
+    SN_KDNode *node = (SN_KDNode *)malloc(sizeof(*node));
+    if (node == NULL) {
+        return NULL;
+    }
+
+    node->shelter = *shelter;
+    node->left = NULL;
+    node->right = NULL;
+    node->split_axis = split_axis;
+    return node;
 }
 
 /* -------------------------------------------------------------------
@@ -90,38 +98,8 @@ void sn_kdtree_destroy(SN_KDNode *tree)
 }
 
 /* -------------------------------------------------------------------
- * Insert (recursive, alternating axis)
+ * Insert (iterative, alternating axis)
  * ------------------------------------------------------------------- */
-
-static SN_KDNode *insert_recursive(SN_KDNode *node,
-                                   const SN_Shelter *shelter,
-                                   int depth)
-{
-    if (node == NULL) {
-        /* TODO: allocate from arena instead of malloc */
-        SN_KDNode *new_node = malloc(sizeof(SN_KDNode));
-        if (new_node == NULL) {
-            return NULL;
-        }
-        new_node->shelter    = *shelter;
-        new_node->left       = NULL;
-        new_node->right      = NULL;
-        new_node->split_axis = depth % 2;
-        return new_node;
-    }
-
-    int    axis     = node->split_axis;
-    double node_val = node_axis_val(node);
-    double ins_val  = point_axis_val(shelter->lat, shelter->lon, axis);
-
-    if (ins_val < node_val) {
-        node->left  = insert_recursive(node->left, shelter, depth + 1);
-    } else {
-        node->right = insert_recursive(node->right, shelter, depth + 1);
-    }
-
-    return node;
-}
 
 int sn_kdtree_insert(SN_KDNode **tree, const SN_Shelter *shelter)
 {
@@ -129,12 +107,48 @@ int sn_kdtree_insert(SN_KDNode **tree, const SN_Shelter *shelter)
         return SN_ERR_INVALID_ARG;
     }
 
-    SN_KDNode *result = insert_recursive(*tree, shelter, 0);
-    if (result == NULL && *tree != NULL) {
-        /* Allocation failure on a non-empty tree */
+    if (*tree == NULL) {
+        *tree = node_create(shelter, 0);
+        return (*tree == NULL) ? SN_ERR_OUT_OF_MEMORY : SN_OK;
+    }
+
+    SN_KDNode *parent = NULL;
+    SN_KDNode *cursor = *tree;
+    SN_KDNode **insert_slot = NULL;
+    int depth = 0;
+
+    while (cursor != NULL) {
+        parent = cursor;
+        insert_slot = NULL;
+
+        const int axis = cursor->split_axis;
+        const double node_val = (axis == 0)
+            ? cursor->shelter.lat
+            : cursor->shelter.lon;
+        const double ins_val = point_axis_val(shelter->lat, shelter->lon, axis);
+
+        if (ins_val < node_val) {
+            insert_slot = &cursor->left;
+            cursor = cursor->left;
+        } else {
+            insert_slot = &cursor->right;
+            cursor = cursor->right;
+        }
+
+        depth++;
+    }
+
+    SN_KDNode *new_node = node_create(shelter, depth & 1);
+    if (new_node == NULL) {
         return SN_ERR_OUT_OF_MEMORY;
     }
-    *tree = result;
+
+    if (parent == NULL || insert_slot == NULL) {
+        free(new_node);
+        return SN_ERR_INVALID_ARG;
+    }
+
+    *insert_slot = new_node;
     return SN_OK;
 }
 
@@ -143,38 +157,55 @@ int sn_kdtree_insert(SN_KDNode **tree, const SN_Shelter *shelter)
  * ------------------------------------------------------------------- */
 
 /**
- * Rough degree-to-metre factor used for axis-aligned pruning.
- * Not exact — only used to skip subtrees that are obviously too far.
- * Actual distance is always confirmed with sn_haversine.
+ * Conservative degree-to-metre lower bounds used for axis-aligned pruning.
+ * Distances are always confirmed with sn_haversine before accepting a result.
  */
-#define SN_DEG_TO_M_LAT 111320.0
+#define SN_DEG_TO_M_LAT_MIN 110574.0
 #define SN_DEG_TO_M_LON_EQ 111320.0  /* at equator; shrinks with cos(lat) */
 
+typedef struct {
+    double query_lat;
+    double query_lon;
+    double radius_m;
+    double radius_lat_deg;
+    double lon_deg_to_m;
+    ResultBuf *result_buf;
+} SearchCtx;
+
 static void search_recursive(const SN_KDNode *node,
-                             double lat, double lon,
-                             double radius_m,
-                             ResultBuf *rb)
+                             const SearchCtx *ctx)
 {
     if (node == NULL) {
         return;
     }
 
-    /* Check this node against the radius using true Haversine distance. */
-    double dist = sn_haversine(lat, lon,
-                               node->shelter.lat, node->shelter.lon);
-    if (dist <= radius_m) {
-        result_buf_push(rb, &node->shelter);
+    if (ctx->result_buf->count >= ctx->result_buf->capacity) {
+        return;
+    }
+
+    /*
+     * Fast reject: meridional distance is a strict lower bound for great-circle
+     * distance, so if this alone exceeds the radius we can skip Haversine.
+     */
+    const double lat_delta_deg = fabs(node->shelter.lat - ctx->query_lat);
+    if (lat_delta_deg <= ctx->radius_lat_deg) {
+        const double dist = sn_haversine(ctx->query_lat, ctx->query_lon,
+                                         node->shelter.lat, node->shelter.lon);
+        if (dist <= ctx->radius_m) {
+            (void)result_buf_push(ctx->result_buf, &node->shelter);
+        }
     }
 
     /* Axis-aligned distance for pruning. */
-    double query_val = point_axis_val(lat, lon, node->split_axis);
-    double node_val  = node_axis_val(node);
-    double diff_deg  = query_val - node_val;
+    const int axis = node->split_axis;
+    const double query_val = point_axis_val(ctx->query_lat, ctx->query_lon, axis);
+    const double node_val = (axis == 0) ? node->shelter.lat : node->shelter.lon;
+    const double diff_deg = query_val - node_val;
 
-    double deg_to_m = (node->split_axis == 0)
-        ? SN_DEG_TO_M_LAT
-        : SN_DEG_TO_M_LON_EQ * cos(lat * M_PI / 180.0);
-    double diff_m = fabs(diff_deg) * deg_to_m;
+    const double deg_to_m = (axis == 0)
+        ? SN_DEG_TO_M_LAT_MIN
+        : ctx->lon_deg_to_m;
+    const double diff_m = fabs(diff_deg) * deg_to_m;
 
     /* Decide which subtree to search first (nearer side). */
     const SN_KDNode *near_child;
@@ -188,11 +219,11 @@ static void search_recursive(const SN_KDNode *node,
     }
 
     /* Always search the near side. */
-    search_recursive(near_child, lat, lon, radius_m, rb);
+    search_recursive(near_child, ctx);
 
     /* Only search the far side if the splitting plane is within radius. */
-    if (diff_m <= radius_m) {
-        search_recursive(far_child, lat, lon, radius_m, rb);
+    if (diff_m <= ctx->radius_m) {
+        search_recursive(far_child, ctx);
     }
 }
 
@@ -205,11 +236,31 @@ int sn_find_nearest(const SN_KDNode *tree,
     if (out == NULL || max_results <= 0) {
         return SN_ERR_INVALID_ARG;
     }
+    if (radius_m < 0.0) {
+        return SN_ERR_INVALID_ARG;
+    }
+    if (tree == NULL) {
+        return 0;
+    }
 
     ResultBuf rb;
     result_buf_init(&rb, out, max_results);
 
-    search_recursive(tree, lat, lon, radius_m, &rb);
+    const double query_lat_rad = lat * (3.14159265358979323846 / 180.0);
+    double lon_deg_to_m = SN_DEG_TO_M_LON_EQ * cos(query_lat_rad);
+    if (lon_deg_to_m < 0.0) {
+        lon_deg_to_m = -lon_deg_to_m;
+    }
+
+    SearchCtx ctx;
+    ctx.query_lat = lat;
+    ctx.query_lon = lon;
+    ctx.radius_m = radius_m;
+    ctx.radius_lat_deg = radius_m / SN_DEG_TO_M_LAT_MIN;
+    ctx.lon_deg_to_m = lon_deg_to_m;
+    ctx.result_buf = &rb;
+
+    search_recursive(tree, &ctx);
 
     return rb.count;
 }
